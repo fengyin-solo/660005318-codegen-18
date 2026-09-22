@@ -42,6 +42,8 @@ devices = {i: DeviceState(i, random.choice(DEVICE_TYPES),
 
 production_log = []
 anomaly_log = []
+# 逐秒采样历史：每台设备的产量/故障计数快照，供时间范围批量对比使用
+sample_log = deque(maxlen=7200)
 
 class AnomalyRules:
     def __init__(self):
@@ -102,6 +104,9 @@ def simulate():
                 dev.status = "FAULT"
 
         production_log.append({"timestamp": time.time(), "count": sum(d.production_count for d in devices.values())})
+        sample_log.append({"ts": time.time(),
+                           "dev": {i: {"p": d.production_count, "f": d.fault_count}
+                                   for i, d in devices.items()}})
 
         try:
             payload = {
@@ -168,6 +173,92 @@ def get_oee():
 @app.get("/api/production")
 def get_production():
     return {"log": production_log[-60:]}
+
+
+class CompareGroup(BaseModel):
+    name: str = ""
+    start: float
+    end: float
+    device_ids: list[int] = []  # 空列表表示全部设备
+
+class CompareRequest(BaseModel):
+    groups: list[CompareGroup]
+    baseline: int = 0  # 基准组在 groups 中的下标
+
+
+def _group_stats(g: CompareGroup, samples: list):
+    """计算单组统计口径与指标，返回 (stats, error_reason)"""
+    ids = [i for i in (g.device_ids or list(devices.keys())) if i in devices]
+    if not ids:
+        return None, "无有效设备"
+    if g.end <= g.start:
+        return None, "时间范围无效(结束时间需晚于开始时间)"
+    in_range = [s for s in samples if g.start <= s["ts"] <= g.end]
+    if not in_range:
+        return None, "该范围无采样数据"
+    # 基准快照取 start 之前最后一个采样，使相邻范围的事件不重复也不遗漏；
+    # 若 start 之前无采样（日志起点），退化为范围内第一个采样
+    before = None
+    for s in samples:
+        if s["ts"] < g.start:
+            before = s
+        else:
+            break
+    start_snap = before if before else in_range[0]
+    end_snap = in_range[-1]
+    production = sum(end_snap["dev"][i]["p"] - start_snap["dev"][i]["p"] for i in ids)
+    faults = sum(end_snap["dev"][i]["f"] - start_snap["dev"][i]["f"] for i in ids)
+    return {
+        "production": production, "faults": faults,
+        "device_ids": ids, "device_count": len(ids),
+        "sample_count": len(in_range),
+        "actual_start": in_range[0]["ts"], "actual_end": in_range[-1]["ts"],
+        "duration": round(in_range[-1]["ts"] - in_range[0]["ts"], 1),
+    }, None
+
+
+@app.post("/api/production/compare")
+def compare_production(req: CompareRequest):
+    """批量对比：多组时间范围/设备组合一次算出产量与故障，跳过无数据或重叠的组，不中断整批"""
+    samples = list(sample_log)
+    groups = req.groups[:20]
+    names = [(g.name.strip() or f"组{i+1}") for i, g in enumerate(groups)]
+
+    # 重叠检测：时间区间相交的组互相标记
+    overlap_with = defaultdict(list)
+    for i in range(len(groups)):
+        for j in range(i + 1, len(groups)):
+            a, b = groups[i], groups[j]
+            if a.start < b.end and b.start < a.end:
+                overlap_with[i].append(j)
+                overlap_with[j].append(i)
+
+    results, skipped = [], []
+    for idx, g in enumerate(groups):
+        try:
+            if idx in overlap_with:
+                others = "、".join(f"「{names[j]}」" for j in overlap_with[idx])
+                skipped.append({"name": names[idx], "reason": f"与{others}时间范围重叠"})
+                continue
+            stats, err = _group_stats(g, samples)
+            if err:
+                skipped.append({"name": names[idx], "reason": err})
+                continue
+            stats["name"] = names[idx]
+            stats["index"] = idx
+            results.append(stats)
+        except Exception as e:
+            skipped.append({"name": names[idx], "reason": f"计算失败: {e}"})
+
+    base = None
+    if results:
+        base = next((r for r in results if r["index"] == req.baseline), results[0])
+        for r in results:
+            r["production_diff"] = r["production"] - base["production"]
+            r["production_diff_pct"] = (round((r["production"] - base["production"]) / base["production"] * 100, 1)
+                                        if base["production"] else None)
+            r["fault_diff"] = r["faults"] - base["faults"]
+    return {"baseline": base["name"] if base else None, "results": results, "skipped": skipped}
 
 
 @app.websocket("/ws")
